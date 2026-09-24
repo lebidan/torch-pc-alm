@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from pcalm.config import ExperimentConfig, MethodConfig, ModelConfig, TrainingConfig
-from pcalm.inference import method_loss, relax
+from pcalm.inference import infer, method_loss
 from pcalm.model import ResidualMLP
 from pcalm.training import train_one
 
@@ -33,7 +33,7 @@ def test_depth_two_and_single_outer_step_compiled_matches_eager():
                         activation="linear", device="cpu")
     x = torch.tensor([[0.2, 0.4]], dtype=torch.float32)
     y = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
-    z, lam = relax(model, x, y, MethodConfig("pcalm", budget=1, state_lr=0.1, inner_steps=2,
+    z, lam = infer(model, x, y, MethodConfig("pcalm", budget=1, state_lr=0.1, inner_steps=2,
                                                   weight_credit_timing="post_dual_energy"))
     assert z.shape == lam.shape == (1, 1, 3)
     assert not z.requires_grad
@@ -65,7 +65,7 @@ def test_cuda_smoke(tmp_path, method):
     assert all(p.is_cuda for p in model.parameters())
     x = torch.randn(2, 12, device="cuda")
     y = torch.nn.functional.one_hot(torch.tensor([0, 1], device="cuda"), 3).float()
-    z, lam = relax(model, x, y, MethodConfig("pcalm", budget=2, state_lr=0.1))
+    z, lam = infer(model, x, y, MethodConfig("pcalm", budget=2, state_lr=0.1))
     assert z.is_cuda and lam.is_cuda
     loss = method_loss(model, x, y, MethodConfig(method, budget=2, state_lr=0.1))
     grads = torch.autograd.grad(loss, list(model.parameters()))

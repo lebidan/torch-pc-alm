@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from pcalm.config import MethodConfig
-from pcalm.inference import energy, method_loss, relax
+from pcalm.inference import energy, infer, method_loss
 from pcalm.model import ResidualMLP
 
 REFERENCE = json.loads((Path(__file__).with_name("jax_reference.json")).read_text())
@@ -56,15 +56,15 @@ def test_fixed_array_jax_parity(activation):
     check(energy(model, X, Y, z0, torch.zeros_like(z0), 1.0), case["energy0"])
 
     pc = MethodConfig(name="pc", budget=3, state_lr=0.1, rho=1.0)
-    check(relax(model, X, Y, MethodConfig(name="pc", budget=1, state_lr=0.1))[0], case["first_free"])
-    check(relax(model, X, Y, pc)[0], case["pc_free"])
+    check(infer(model, X, Y, MethodConfig(name="pc", budget=1, state_lr=0.1))[0], case["first_free"])
+    check(infer(model, X, Y, pc)[0], case["pc_free"])
     check_grads(weight_grads(model, MethodConfig(name="bp")), case["bp_grad"])
     check_grads(weight_grads(model, pc), case["pc_grad"])
     for timing in ("pre_dual_energy", "post_dual_energy"):
         expected = case[timing]
         pcalm = MethodConfig(name="pcalm", budget=3, alpha=1.0, rho=1.0, state_lr=0.1,
                              inner_steps=2, weight_credit_timing=timing)
-        z, lam = relax(model, X, Y, pcalm)
+        z, lam = infer(model, X, Y, pcalm)
         check(z, expected["free"])
         check(lam, expected["dual"])
         check_grads(weight_grads(model, pcalm), expected["grad"])

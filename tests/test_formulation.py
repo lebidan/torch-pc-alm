@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from pcalm.config import MethodConfig
-from pcalm.inference import method_loss, relax
+from pcalm.inference import infer, method_loss
 from pcalm.model import ResidualMLP
 from pcalm.training import adam_learning_rate
 
@@ -30,7 +30,7 @@ def test_constraints_are_hidden_edges_only():
 
 def test_pc_has_zero_duals():
     model, x, y = small_case()
-    _, duals = relax(model, x, y, MethodConfig(name="pc", budget=2, state_lr=0.1))
+    _, duals = infer(model, x, y, MethodConfig(name="pc", budget=2, state_lr=0.1))
     assert torch.count_nonzero(duals) == 0
 
 
@@ -44,7 +44,7 @@ def test_pcalm_alpha_zero_matches_pc_gradient():
 
 def test_pcalm_duals_update_hidden_edges():
     model, x, y = small_case()
-    _, duals = relax(model, x, y, pcalm(budget=2, weight_credit_timing="post_dual_energy"))
+    _, duals = infer(model, x, y, pcalm(budget=2, weight_credit_timing="post_dual_energy"))
     assert duals.shape == (3, x.shape[0], 5)
     assert torch.count_nonzero(duals) > 0
 
@@ -56,8 +56,8 @@ def test_default_adam_lr_uses_width_depth_scaling():
 
 def test_inference_is_per_sample_batch_invariant():
     model, x, y = small_case()
-    z_single, _ = relax(model, x[:1], y[:1], pcalm(alpha=1.0))
-    z_batch, _ = relax(model, x, y, pcalm(alpha=1.0))
+    z_single, _ = infer(model, x[:1], y[:1], pcalm(alpha=1.0))
+    z_batch, _ = infer(model, x, y, pcalm(alpha=1.0))
     torch.testing.assert_close(z_single[:, 0], z_batch[:, 0], atol=1e-5, rtol=1e-5)
 
 

@@ -1,8 +1,9 @@
 """BP, PC, and PC-ALM weight gradients, all obtained by autograd.
 
-PC and PC-ALM relax the hidden states `z` (the free variables `free` of the
-original JAX code) and, for PC-ALM, the duals `lam`, with the weights held fixed, then take the weight gradient of the energy at
-the final, detached `z` and `lam`. No gradient flows through the relaxation.
+During inference, PC and PC-ALM update the hidden states `z` (the free
+variables `free` of the original JAX code) and, for PC-ALM, the duals `lam`,
+with the weights held fixed. They then take the weight gradient of the energy
+at the final, detached `z` and `lam`. No gradient flows through inference.
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ def _outer_step(model, x, y, z, lam, *, state_lr, rho, alpha, inner_steps, updat
 
 
 @torch.no_grad()
-def relax(model: ResidualMLP, x, y, method: MethodConfig) -> tuple[torch.Tensor, torch.Tensor]:
+def infer(model: ResidualMLP, x, y, method: MethodConfig) -> tuple[torch.Tensor, torch.Tensor]:
     """Run PC or PC-ALM inference from the feed-forward states.
 
     PC is `budget` activity steps with zero duals. PC-ALM runs `budget` outer
@@ -62,5 +63,5 @@ def method_loss(model: ResidualMLP, x, y, method: MethodConfig) -> torch.Tensor:
     """Scalar whose weight gradient is the method's update direction."""
     if method.name == "bp":
         return mse(model(x), y)
-    z, lam = relax(model, x, y, method)
+    z, lam = infer(model, x, y, method)
     return energy(model, x, y, z, lam, method.rho)
