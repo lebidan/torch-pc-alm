@@ -1,105 +1,63 @@
 from __future__ import annotations
 
 import math
-from typing import Callable
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
-Params = list[torch.Tensor] | nn.ParameterList
-
-
-def linear_activation(x: torch.Tensor) -> torch.Tensor:
-    return x
-
-
-def activation_fn(name: str) -> Callable[[torch.Tensor], torch.Tensor]:
-    if name == "linear":
-        return linear_activation
-    if name == "tanh":
-        return torch.tanh
-    if name == "relu":
-        return torch.relu
-    raise ValueError(f"unknown activation: {name}")
-
-
-def activation_derivative(phi, x: torch.Tensor) -> torch.Tensor:
-    if phi is linear_activation:
-        return torch.ones_like(x)
-    if phi is torch.tanh:
-        activated = torch.tanh(x)
-        return 1.0 - activated * activated
-    if phi is torch.relu:
-        return (x > 0).to(x.dtype)
-    raise ValueError("packed inference supports linear, tanh, and relu activations")
-
-
-def model_scales(width: int, depth: int, input_dim: int) -> list[float]:
-    if depth < 2:
-        raise ValueError("depth must include at least one hidden layer and one output layer")
-    return [1.0 / math.sqrt(input_dim)] + [1.0 / math.sqrt(width * depth)] * (depth - 2) + [1.0 / width]
-
-
-def skip_mask(depth: int) -> tuple[bool, ...]:
-    return tuple([False] + [True] * (depth - 2) + [False])
-
-
-def init_params(
-    seed: int,
-    *,
-    depth: int,
-    width: int,
-    input_dim: int,
-    output_dim: int,
-    device: torch.device | str = "cpu",
-    dtype: torch.dtype = torch.float32,
-) -> nn.ParameterList:
-    device = torch.device(device)
-    generator = torch.Generator(device=device).manual_seed(seed)
-    layers = nn.ParameterList()
-    for layer_ix in range(depth):
-        in_dim = input_dim if layer_ix == 0 else width
-        out_dim = output_dim if layer_ix == depth - 1 else width
-        layers.append(nn.Parameter(torch.randn((out_dim, in_dim), generator=generator, device=device, dtype=dtype)))
-    return layers
-
-
-def block_pred(
-    W: torch.Tensor,
-    scale: float,
-    skip: bool,
-    z_prev: torch.Tensor,
-    phi: Callable[[torch.Tensor], torch.Tensor],
-    *,
-    is_first: bool,
-) -> torch.Tensor:
-    inp = z_prev if is_first else phi(z_prev)
-    pred = scale * (inp @ W.T)
-    if skip:
-        pred = pred + z_prev
-    return pred
-
-
-def forward(params: Params, scales: list[float], skips: tuple[bool, ...], x: torch.Tensor, phi) -> list[torch.Tensor]:
-    acts = []
-    z_prev = x
-    for layer_ix, W in enumerate(params):
-        z_prev = block_pred(W, scales[layer_ix], skips[layer_ix], z_prev, phi, is_first=(layer_ix == 0))
-        acts.append(z_prev)
-    return acts
-
-
-def logits(params: Params, scales: list[float], skips: tuple[bool, ...], x: torch.Tensor, phi) -> torch.Tensor:
-    return forward(params, scales, skips, x, phi)[-1]
+ACTIVATIONS = {"linear": nn.Identity, "tanh": nn.Tanh, "relu": nn.ReLU}
 
 
 class ResidualMLP(nn.Module):
-    def __init__(self, *, seed: int, depth: int, width: int, input_dim: int, output_dim: int, activation: str, device: torch.device | str):
+    """Bias-free residual MLP with `depth - 1` hidden blocks and one output block.
+
+    first block:   z_1 = s_in * x @ W_in.T                   (no activation on x)
+    middle blocks: z_l = z_{l-1} + s_mid * phi(z_{l-1}) @ W_l.T
+    output block:  out = s_out * phi(z_{L-1}) @ W_out.T      (no skip)
+
+    The `depth - 2` middle weights share one shape, so they are stored stacked
+    as a single `[depth - 2, width, width]` parameter. Hidden states `z` (the
+    "free variables" `free` of the original JAX code) are stacked the same way,
+    `[depth - 1, batch, width]`, so every middle-layer constraint is evaluated
+    with a single batched matmul.
+    """
+
+    def __init__(self, *, seed: int, depth: int, width: int, input_dim: int, output_dim: int,
+                 activation: str, device: torch.device | str = "cpu"):
         super().__init__()
-        self.weights = init_params(seed, depth=depth, width=width, input_dim=input_dim, output_dim=output_dim, device=device)
-        self.scales = model_scales(width, depth, input_dim)
-        self.skips = skip_mask(depth)
-        self.phi = activation_fn(activation)
+        if depth < 2:
+            raise ValueError("depth must include at least one hidden layer and one output layer")
+        if activation not in ACTIVATIONS:
+            raise ValueError(f"unknown activation: {activation}")
+        # Draw on the CPU so a seed gives the same weights on every device.
+        gen = torch.Generator().manual_seed(seed)
+        self.w_in = nn.Parameter(torch.randn(width, input_dim, generator=gen))
+        self.w_mid = nn.Parameter(torch.randn(depth - 2, width, width, generator=gen))
+        self.w_out = nn.Parameter(torch.randn(output_dim, width, generator=gen))
+        self.to(device)
+        self.s_in = 1.0 / math.sqrt(input_dim)
+        self.s_mid = 1.0 / math.sqrt(width * depth)
+        self.s_out = 1.0 / width
+        self.phi = ACTIVATIONS[activation]()
+
+    def feedforward_hidden(self, x: torch.Tensor) -> torch.Tensor:
+        """Feed-forward hidden states, stacked as `[depth - 1, batch, width]`."""
+        z = self.s_in * F.linear(x, self.w_in)
+        states = [z]
+        for W in self.w_mid:
+            z = z + self.s_mid * F.linear(self.phi(z), W)
+            states.append(z)
+        return torch.stack(states)
+
+    def readout(self, z_last: torch.Tensor) -> torch.Tensor:
+        return self.s_out * F.linear(self.phi(z_last), self.w_out)
+
+    def constraint_residuals(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """Hidden-edge constraints `c_l = z_l - block_l(z_{l-1})`; zero on the feed-forward pass."""
+        first = z[0] - self.s_in * F.linear(x, self.w_in)
+        middle = z[1:] - z[:-1] - self.s_mid * torch.bmm(self.phi(z[:-1]), self.w_mid.mT)
+        return torch.cat((first[None], middle))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return logits(self.weights, self.scales, self.skips, x, self.phi)
+        return self.readout(self.feedforward_hidden(x)[-1])

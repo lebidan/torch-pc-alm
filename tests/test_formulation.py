@@ -1,53 +1,52 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
-from pcalm.inference import Schedule, constraint_residuals, method_grad, run_pc, run_pcalm
-from pcalm.model import activation_fn, init_params, model_scales, skip_mask
+from pcalm.config import MethodConfig
+from pcalm.inference import method_loss, relax
+from pcalm.model import ResidualMLP
 from pcalm.training import adam_learning_rate
 
 
 def small_case():
-    params = init_params(0, depth=4, width=5, input_dim=3, output_dim=2)
-    scales = model_scales(width=5, depth=4, input_dim=3)
-    skips = skip_mask(4)
-    phi = activation_fn("tanh")
+    model = ResidualMLP(seed=0, depth=4, width=5, input_dim=3, output_dim=2, activation="tanh")
     x = torch.randn((7, 3), generator=torch.Generator().manual_seed(1))
     y = torch.nn.functional.one_hot(torch.arange(7) % 2, 2).float()
-    return params, scales, skips, phi, x, y
+    return model, x, y
+
+
+def pcalm(**kw):
+    return MethodConfig(**{"name": "pcalm", "budget": 3, "state_lr": 0.1, "rho": 1.0, **kw})
 
 
 def test_constraints_are_hidden_edges_only():
-    params, scales, skips, phi, x, _ = small_case()
-    free = [torch.zeros((x.shape[0], 5)) for _ in range(3)]
-    residuals = constraint_residuals(params, scales, skips, x, free, phi)
-    assert len(residuals) == len(params) - 1
-    assert all(r.shape == (x.shape[0], 5) for r in residuals)
+    model, x, _ = small_case()
+    z = model.feedforward_hidden(x)
+    residuals = model.constraint_residuals(x, z)
+    assert residuals.shape == (3, x.shape[0], 5)
+    torch.testing.assert_close(residuals, torch.zeros_like(residuals), atol=1e-6, rtol=0)
 
 
 def test_pc_has_zero_duals():
-    params, scales, skips, phi, x, y = small_case()
-    _, duals = run_pc(params, scales, skips, x, y, state_lr=0.1, rho=1.0, steps=2, phi=phi)
-    assert all(torch.allclose(dual, torch.zeros_like(dual)) for dual in duals)
+    model, x, y = small_case()
+    _, duals = relax(model, x, y, MethodConfig(name="pc", budget=2, state_lr=0.1))
+    assert torch.count_nonzero(duals) == 0
 
 
 def test_pcalm_alpha_zero_matches_pc_gradient():
-    params, scales, skips, phi, x, y = small_case()
-    pc_schedule = Schedule(family="pc", budget=3)
-    alm_schedule = Schedule(family="pcalm", budget=3, alpha=0.0)
-    g_pc = method_grad(params, scales, skips, x, y, pc_schedule, state_lr=0.1, rho=1.0, phi=phi)
-    g_alm = method_grad(params, scales, skips, x, y, alm_schedule, state_lr=0.1, rho=1.0, phi=phi)
+    model, x, y = small_case()
+    g_pc = torch.autograd.grad(method_loss(model, x, y, pcalm(name="pc")), list(model.parameters()))
+    g_alm = torch.autograd.grad(method_loss(model, x, y, pcalm(alpha=0.0)), list(model.parameters()))
     for a, b in zip(g_pc, g_alm):
-        assert torch.allclose(a, b, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-5)
 
 
 def test_pcalm_duals_update_hidden_edges():
-    params, scales, skips, phi, x, y = small_case()
-    _, duals = run_pcalm(params, scales, skips, x, y, state_lr=0.1, rho=1.0,
-                         alpha=1.0, budget=2, inner_steps=1,
-                         weight_credit_timing="post_dual_energy", phi=phi)
-    assert len(duals) == len(params) - 1
-    assert any(float(torch.linalg.norm(dual)) > 0.0 for dual in duals)
+    model, x, y = small_case()
+    _, duals = relax(model, x, y, pcalm(budget=2, weight_credit_timing="post_dual_energy"))
+    assert duals.shape == (3, x.shape[0], 5)
+    assert torch.count_nonzero(duals) > 0
 
 
 def test_default_adam_lr_uses_width_depth_scaling():
@@ -56,10 +55,14 @@ def test_default_adam_lr_uses_width_depth_scaling():
 
 
 def test_inference_is_per_sample_batch_invariant():
-    params, scales, skips, phi, x, y = small_case()
-    kw = dict(state_lr=0.1, rho=1.0, alpha=1.0, budget=3, inner_steps=1,
-              weight_credit_timing="pre_dual_energy", phi=phi)
-    free_single, _ = run_pcalm(params, scales, skips, x[:1], y[:1], **kw)
-    free_batch, _ = run_pcalm(params, scales, skips, x, y, **kw)
-    for a, b in zip(free_single, free_batch):
-        assert torch.allclose(a[0], b[0], atol=1e-5, rtol=1e-5)
+    model, x, y = small_case()
+    z_single, _ = relax(model, x[:1], y[:1], pcalm(alpha=1.0))
+    z_batch, _ = relax(model, x, y, pcalm(alpha=1.0))
+    torch.testing.assert_close(z_single[:, 0], z_batch[:, 0], atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("bad", [dict(name="sgd"), dict(rho=0.0), dict(budget=0), dict(inner_steps=0),
+                                 dict(weight_credit_timing="later")])
+def test_invalid_method_config_is_rejected(bad):
+    with pytest.raises(ValueError):
+        pcalm(**bad)

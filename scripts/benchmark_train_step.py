@@ -11,9 +11,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pcalm.inference import Schedule, method_grad
+from pcalm.config import MethodConfig
+from pcalm.inference import method_loss
 from pcalm.model import ResidualMLP
-from pcalm.optim import make_adam
 
 
 def main() -> None:
@@ -32,18 +32,15 @@ def main() -> None:
     device = torch.device(args.device)
     model = ResidualMLP(seed=0, depth=args.depth, width=args.width, input_dim=784,
                         output_dim=10, activation="relu", device=device)
-    optimizer = make_adam(model.parameters(), 1e-3)
-    schedule = Schedule(args.method, 0 if args.method == "bp" else args.budget, alpha=1.0)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    method = MethodConfig(args.method, budget=0 if args.method == "bp" else args.budget, alpha=1.0, state_lr=0.25)
     x = torch.randn(args.batch_size, 784, device=device)
     labels = torch.randint(0, 10, (args.batch_size,), device=device)
     y = torch.nn.functional.one_hot(labels, 10).float()
 
     def step() -> None:
         optimizer.zero_grad(set_to_none=True)
-        grads = method_grad(model.weights, model.scales, model.skips, x, y, schedule,
-                            state_lr=0.25, rho=1.0, phi=model.phi)
-        for p, g in zip(model.weights, grads):
-            p.grad = g
+        method_loss(model, x, y, method).backward()
         optimizer.step()
 
     for _ in range(args.warmup):
@@ -58,7 +55,7 @@ def main() -> None:
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
     print({"method": args.method, "width": args.width, "depth": args.depth,
-           "budget": schedule.budget, "batch_size": args.batch_size,
+           "budget": method.budget, "batch_size": args.batch_size,
            "warmup_steps": args.warmup, "measured_steps": args.steps,
            "seconds_per_step": elapsed / args.steps,
            "peak_allocated_mib": (torch.cuda.max_memory_allocated() / 2**20 if device.type == "cuda" else None)})

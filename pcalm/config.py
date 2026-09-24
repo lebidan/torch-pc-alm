@@ -26,6 +26,16 @@ class MethodConfig:
     inner_steps: int = 1
     weight_credit_timing: str = "pre_dual_energy"
 
+    def __post_init__(self):
+        if self.name not in {"bp", "pc", "pcalm"}:
+            raise ValueError(f"unknown method: {self.name}")
+        if self.rho <= 0:
+            raise ValueError("rho must be positive")
+        if self.name == "pcalm" and (self.budget < 1 or self.inner_steps < 1):
+            raise ValueError("PC-ALM budget and inner_steps must be at least 1")
+        if self.weight_credit_timing not in {"pre_dual_energy", "post_dual_energy"}:
+            raise ValueError("weight_credit_timing must be pre_dual_energy or post_dual_energy")
+
 
 @dataclass(frozen=True)
 class TrainingConfig:
